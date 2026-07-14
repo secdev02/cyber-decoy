@@ -1,0 +1,64 @@
+name: cyber-decoy
+
+services:
+  broker:
+    build:
+      context: ./broker
+    container_name: decoy-broker
+    restart: unless-stopped
+    # eBPF TC attachment needs these capabilities plus a mounted BPF fs.
+    # Prefer scoped capabilities over full privileged mode where the host
+    # kernel allows it (see README for the privileged fallback).
+    cap_add:
+      - NET_ADMIN
+      - BPF
+      - PERFMON
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "22:22"
+      - "3389:3389"
+      - "445:445"
+    networks:
+      - edge
+      - decoynet
+    depends_on:
+      - ssh-decoy
+      - rdp-decoy
+      - smb-decoy
+
+  ssh-decoy:
+    build:
+      context: ./decoys
+      dockerfile: ssh/Dockerfile
+    container_name: decoy-ssh
+    restart: unless-stopped
+    networks:
+      - decoynet
+
+  rdp-decoy:
+    build:
+      context: ./decoys
+      dockerfile: rdp/Dockerfile
+    container_name: decoy-rdp
+    restart: unless-stopped
+    networks:
+      - decoynet
+
+  smb-decoy:
+    build:
+      context: ./decoys
+      dockerfile: smb/Dockerfile
+    container_name: decoy-smb
+    restart: unless-stopped
+    networks:
+      - decoynet
+
+networks:
+  # Public-facing network where the broker publishes ports to the host.
+  edge:
+    driver: bridge
+  # Internal network. Decoys are reachable only by the broker, never the host.
+  decoynet:
+    driver: bridge
+    internal: true

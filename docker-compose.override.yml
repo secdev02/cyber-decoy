@@ -1,0 +1,25 @@
+# Local development override, intended for Docker Desktop on macOS.
+#
+# Docker Desktop runs containers inside a LinuxKit VM rather than on the host
+# kernel, so TC/TCX eBPF attach generally will not work. The broker treats eBPF
+# as best effort: it logs "ebpf disabled: attach failed" and continues serving
+# the reverse proxy and all three decoys, so the full proxy path is still
+# testable locally.
+#
+# This file drops the eBPF capabilities (which are useless in that VM) and
+# remaps host port 22, which collides with the Mac's own SSH daemon.
+#
+# Compose loads docker-compose.override.yml automatically:
+#     docker compose up --build
+#
+# To run the real thing on a Linux host with kernel 6.6+, bypass this file:
+#     docker compose -f docker-compose.yml up --build
+
+services:
+  broker:
+    cap_add: !reset []
+    security_opt: !reset []
+    ports: !override
+      - "2022:22"     # host 22 is taken by the Mac's sshd
+      - "3389:3389"
+      - "445:445"

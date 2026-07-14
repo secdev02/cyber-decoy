@@ -1,0 +1,20 @@
+# eBPF build output
+*.o
+*.bpf.o
+
+# Go
+# Note: go.sum is intentionally NOT ignored. It should be committed for an
+# application repository so builds are reproducible.
+/broker/broker
+bin/
+vendor/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local logs and captures
+*.log
+*.pcap

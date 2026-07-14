@@ -1,0 +1,25 @@
+# Broker configuration.
+#
+# Each service is advertised on listen_port and proxied to backend, which is a
+# decoy container reachable only on the internal Docker network. Toggle a
+# service with "enabled".
+
+interface: eth0
+bpf_object: /opt/decoy/decoy.bpf.o
+dial_timeout_seconds: 5
+
+services:
+  - name: ssh
+    enabled: true
+    listen_port: 22
+    backend: ssh-decoy:2222
+
+  - name: rdp
+    enabled: true
+    listen_port: 3389
+    backend: rdp-decoy:3389
+
+  - name: smb
+    enabled: true
+    listen_port: 445
+    backend: smb-decoy:445
