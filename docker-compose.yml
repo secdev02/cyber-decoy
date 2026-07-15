@@ -27,19 +27,22 @@ services:
       - rdp-decoy
       - smb-decoy
 
+  # Each decoy is self-contained, so its build context is its own directory.
   ssh-decoy:
     build:
-      context: ./decoys
-      dockerfile: ssh/Dockerfile
+      context: ./decoys/ssh
     container_name: decoy-ssh
     restart: unless-stopped
     networks:
       - decoynet
+    volumes:
+      # Persist the generated SSH host key. Without this, the fingerprint
+      # changes on every restart, which is a giveaway that the host is fake.
+      - ssh-keys:/var/lib/opencanary
 
   rdp-decoy:
     build:
-      context: ./decoys
-      dockerfile: rdp/Dockerfile
+      context: ./decoys/rdp
     container_name: decoy-rdp
     restart: unless-stopped
     networks:
@@ -47,12 +50,15 @@ services:
 
   smb-decoy:
     build:
-      context: ./decoys
-      dockerfile: smb/Dockerfile
+      context: ./decoys/smb
     container_name: decoy-smb
     restart: unless-stopped
     networks:
       - decoynet
+    # smbd binds 445, a privileged port, and needs to manage its own process
+    # group. Everything here runs as root inside an internal-only container.
+    cap_add:
+      - NET_BIND_SERVICE
 
 networks:
   # Public-facing network where the broker publishes ports to the host.
@@ -62,3 +68,6 @@ networks:
   decoynet:
     driver: bridge
     internal: true
+
+volumes:
+  ssh-keys:

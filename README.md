@@ -21,25 +21,36 @@ The design separates two concerns:
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A[Attacker / Scanner] -->|22, 3389, 445| B
+flowchart TB
+    A["Attacker / Scanner"]
 
-    subgraph host [Decoy Host]
-        subgraph broker [broker container]
-            E[eBPF TC classifier<br/>observes every SYN]
-            P[Reverse proxy<br/>port to backend]
-            R[(ring buffer<br/>connection events)]
-            E --> R --> L[structured logs]
+    subgraph host["Decoy Host"]
+        direction TB
+
+        NIC["broker eth0<br/>published: 22, 3389, 445"]
+
+        subgraph brk["broker container"]
+            direction TB
+            E["eBPF TC classifier<br/>logs every SYN<br/>sees true source IP"]
+            P["reverse proxy<br/>CONNECT to backend"]
+            L["structured JSON logs"]
         end
-        B[eth0] --> E
-        B --> P
-        P -->|ssh-decoy:2222| S[ssh-decoy]
-        P -->|rdp-decoy:3389| D[rdp-decoy]
-        P -->|smb-decoy:445| M[smb-decoy]
+
+        subgraph dec["decoynet (internal, no host route)"]
+            direction LR
+            S["ssh-decoy<br/>OpenCanary ssh<br/>port 2222"]
+            D["rdp-decoy<br/>OpenCanary rdp<br/>port 3389"]
+            M["smb-decoy<br/>Samba + OpenCanary<br/>port 445"]
+        end
     end
 
-    classDef net fill:#eef,stroke:#88a
-    class S,D,M net
+    A --> NIC
+    NIC --> E
+    NIC --> P
+    E --> L
+    P --> S
+    P --> D
+    P --> M
 ```
 
 Four containers in total:
@@ -47,9 +58,9 @@ Four containers in total:
 | Container   | Role                                                        | Network        |
 |-------------|-------------------------------------------------------------|----------------|
 | `broker`    | Public front door: eBPF observation plus reverse proxy      | edge + decoynet |
-| `ssh-decoy` | Fake SSH service                                            | decoynet only  |
-| `rdp-decoy` | Fake RDP service                                            | decoynet only  |
-| `smb-decoy` | Fake SMB service                                            | decoynet only  |
+| `ssh-decoy` | OpenCanary `ssh` module (real handshake, captures creds)     | decoynet only  |
+| `rdp-decoy` | OpenCanary `rdp` module (NLA mimic, captures usernames)     | decoynet only  |
+| `smb-decoy` | Samba + OpenCanary `smb` module (audits file access)        | decoynet only  |
 
 The decoys live on an `internal` Docker network (`decoynet`) with no route to
 the host or the outside world. Only the broker can reach them. Nothing an
@@ -101,11 +112,19 @@ cyber-decoy/
 │       ├── config/config.go   # config loader
 │       ├── proxy/proxy.go     # TCP reverse proxy
 │       └── bpf/loader.go      # loads + attaches eBPF, streams events
-└── decoys/
-    ├── common/responder.py    # shared placeholder decoy
-    ├── ssh/Dockerfile
-    ├── rdp/Dockerfile
-    └── smb/Dockerfile
+└── decoys/                     # all three run OpenCanary
+    ├── ssh/
+    │   ├── Dockerfile
+    │   └── opencanary.conf     # ssh module, port 2222
+    ├── rdp/
+    │   ├── Dockerfile
+    │   └── opencanary.conf     # rdp module, port 3389
+    └── smb/
+        ├── Dockerfile
+        ├── opencanary.conf     # smb module (log watcher)
+        ├── smb.conf            # samba + full_audit VFS
+        ├── rsyslog-samba.conf  # local7 -> samba-audit.log
+        └── supervisord.conf    # rsyslogd + smbd + opencanaryd
 ```
 
 ## Requirements
@@ -172,8 +191,20 @@ nc DECOY_HOST 445                  # hits the SMB decoy
 nc DECOY_HOST 8080                 # unadvertised: observed by eBPF, no proxy
 ```
 
-You will see structured JSON logs from the broker for both the eBPF probe events
-and the proxied sessions, plus per-connection logs from each decoy container.
+The broker emits JSON for eBPF probe events and proxied sessions; each decoy
+emits OpenCanary JSON events. To watch credentials land:
+
+```bash
+docker compose logs -f ssh-decoy | grep 4002
+```
+
+Unlike a banner-only stub, `ssh -p 22 user@DECOY_HOST` now completes a real key
+exchange and prompts for a password. Every attempt is captured. Verify the
+service fingerprint holds up under version detection:
+
+```bash
+nmap -sV -p 22,3389,445 DECOY_HOST
+```
 
 Tear down with:
 
@@ -204,19 +235,130 @@ you can remap the published side in `docker-compose.yml`, for example
 
 ## The decoy backends
 
-The included decoys (`decoys/common/responder.py`) are deliberately
-**low-interaction placeholders**: they accept a connection, send an optional
-banner, log the first bytes received, and close. They exist so the pipeline is
-end to end from day one. Replace them with real emulators as needed:
+All three decoys run [OpenCanary](https://github.com/thinkst/opencanary)
+(Thinkst), configured so each container enables exactly one module. Logs are
+emitted as JSON on stdout, so `docker compose logs` and any SIEM shipper work
+without extra plumbing.
 
-| Service | Suggested higher-interaction replacement |
-|---------|-------------------------------------------|
-| SSH     | [Cowrie](https://github.com/cowrie/cowrie) |
-| RDP     | [RDPy](https://github.com/citronneur/rdpy) |
-| SMB     | [Dionaea](https://github.com/DinoTools/dionaea) or [Heralding](https://github.com/johnnykv/heralding) |
+| Container   | OpenCanary module | Listens | What it actually does |
+|-------------|-------------------|---------|-----------------------|
+| `ssh-decoy` | `ssh`             | 2222    | Real SSH key exchange via twisted.conch. Captures every username/password pair. |
+| `rdp-decoy` | `rdp`             | 3389    | Mimics an NLA-enabled server, always returns login failure, extracts the `mstshash` username. |
+| `smb-decoy` | `smb`             | 445     | Real Samba with the `full_audit` VFS; OpenCanary tails the audit log and reports file access. |
 
-Because the broker only needs a `host:port` backend, swapping a decoy is just a
-matter of changing the container and the `backend` value in `config.yaml`.
+### Event types
+
+OpenCanary tags each event with a numeric `logtype`. The ones you will see here:
+
+| logtype | Constant in `opencanary/logger.py` | Meaning |
+|---------|------------------------------------|---------|
+| 1000    | `LOG_BASE_BOOT`            | Daemon startup |
+| 4000    | `LOG_SSH_NEW_CONNECTION`   | SSH connection opened |
+| 4001    | `LOG_SSH_REMOTE_VERSION_SENT` | Client sent its version string |
+| 4002    | `LOG_SSH_LOGIN_ATTEMPT`    | SSH login attempt (includes USERNAME and PASSWORD) |
+| 5000    | `LOG_SMB_FILE_OPEN`        | SMB file opened (includes USER, SHARENAME, FILENAME) |
+| 14001   | `LOG_RDP`                  | RDP connection / login attempt |
+
+A captured SSH credential looks like this:
+
+```json
+{"dst_port": 2222, "logtype": 4002, "node_id": "decoy-ssh",
+ "src_host": "10.0.0.66", "src_port": 42958,
+ "logdata": {"USERNAME": "admin", "PASSWORD": "Passw0rd123"}}
+```
+
+### Important: the decoys cannot see the attacker's IP
+
+This is a direct consequence of the broker architecture, and it is the single
+most important thing to understand about reading these logs.
+
+The broker terminates the attacker's TCP connection and opens a **new** one to
+the decoy. So from OpenCanary's point of view, the client is the broker. Every
+`src_host` in a decoy event, and every `%I` in a Samba audit line, will be the
+broker's address on `decoynet`, not the real source.
+
+The true source IP is still captured, just in a different place:
+
+| Layer | Knows the real source IP? | Knows what was attempted? |
+|-------|---------------------------|---------------------------|
+| eBPF classifier (`probe observed`) | Yes | No, SYN metadata only |
+| Broker proxy (`session opened`)    | Yes | No, byte counts only |
+| OpenCanary decoy (`logtype 4002`)  | **No** | Yes, credentials/files |
+
+So attribution requires correlating broker logs with decoy logs, joining on
+timestamp and service. The broker logs `remote` (the true attacker address) and
+`backend` for every session, which is what makes the join possible:
+
+```bash
+docker compose logs broker    | grep 'session opened'   # who
+docker compose logs ssh-decoy | grep '"logtype": 4002'  # what they tried
+```
+
+If you need the real IP inside the decoy itself, the options are to send PROXY
+protocol (OpenCanary does not parse it, so this would mean patching it), or to
+replace the userspace proxy with a transparent redirect (TPROXY or eBPF
+`bpf_sk_assign`) that preserves the original source address. Both are listed
+under Roadmap. Until then, treat the broker as the source of truth for "who" and
+the decoy as the source of truth for "what".
+
+### Why the SMB decoy is different
+
+This is the one real wrinkle. **OpenCanary's `smb` module does not implement
+SMB.** Reading `opencanary/modules/samba.py` shows it is a `FileSystemWatcher`:
+it tails an audit file and parses lines containing `smbd_audit`, which are
+produced by a real Samba server running the `full_audit` VFS module.
+
+So `smb-decoy` runs three processes under supervisord:
+
+```
+rsyslogd     receives smbd_audit lines on syslog facility local7
+smbd         the actual SMB protocol implementation
+opencanaryd  tails /var/log/samba-audit.log, emits JSON events
+```
+
+The `full_audit:prefix` in `decoys/smb/smb.conf` is load-bearing, not cosmetic.
+`samba.py` splits each line on `|` and reads fixed positions, so the prefix must
+be exactly:
+
+```
+full_audit:prefix = %U|%I|%i|%m|%S|%L|%R|%a|%T|%D
+```
+
+This is the exact prefix published in Thinkst's
+[OpenCanary and Samba](https://github.com/thinkst/opencanary/wiki/Opencanary-and-Samba)
+wiki page. full_audit appends `action|status|path` after it, giving 13 fields.
+Reordering the prefix will silently produce garbled events rather than an error.
+
+`full_audit:success` is set to `connect disconnect flistxattr`. Thinkst use
+`flistxattr` as the file-open trigger. Valid VFS operation names change between
+Samba releases (for example `open` became `openat`), so if events stop after a
+Samba upgrade, this list is the first thing to check. Confirm the module is
+compiled in with `smbd -b | grep full_audit`.
+
+The SSH and RDP decoys have no such dependency and are single-process.
+
+### Configuring the decoys
+
+Each decoy owns an `opencanary.conf` (installed to `/etc/opencanaryd/`). Useful
+knobs:
+
+- **SSH banner**: `ssh.version` in `decoys/ssh/opencanary.conf`. It currently
+  claims `SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1`. Make it match the OS you are
+  pretending to be; a Ubuntu banner on a box claiming to be Windows is a tell.
+- **SMB share names**: the `[HR-Payroll]` and `[Backups]` sections in
+  `decoys/smb/smb.conf`, plus the bait files created in `decoys/smb/Dockerfile`.
+  The filenames are the lure.
+- **Ports**: keep these aligned with `backend` in `broker/config.yaml`.
+
+To enable another OpenCanary module (ftp, telnet, mysql, vnc, redis, and others
+are available), set `<module>.enabled` and `<module>.port`, add a decoy container,
+and add a matching service to `broker/config.yaml`.
+
+### SSH host key persistence
+
+`ssh-decoy` mounts a named volume at `/var/lib/opencanary` (`ssh.key_path`), so
+the generated host key survives restarts. Without it OpenCanary generates a fresh
+key on every start and the changing fingerprint is an obvious tell.
 
 ## Security notes
 
@@ -234,6 +376,8 @@ matter of changing the container and the `backend` value in `config.yaml`.
 
 ## Roadmap ideas
 
+- Preserve the attacker's source IP into the decoys via TPROXY or
+  `bpf_sk_assign`, removing the need to correlate broker and decoy logs.
 - Full-port funnel via eBPF destination rewrite or TPROXY.
 - Session capture to PCAP per connection.
 - Ship events to a SIEM (JSON logs are already structured for this).
