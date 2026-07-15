@@ -1,0 +1,4 @@
+# Impacket provides SimpleSMBServer. Pin a current release: the honeypot-
+# relevant path traversal CVE-2021-31800 was fixed in 0.9.23, so this must
+# never be downgraded below that. 0.13.1 is the latest at time of writing.
+impacket==0.13.1

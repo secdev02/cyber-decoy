@@ -9,6 +9,7 @@ help:
 	@echo "  ps         Show stack status"
 	@echo "  bpf        Compile the eBPF object locally (needs clang + libbpf-dev)"
 	@echo "  broker-fmt Format the Go broker sources"
+	@echo "   Troubleshoot the SMB decoy audit chain"
 	@echo "  clean      Remove local build artifacts"
 
 build:

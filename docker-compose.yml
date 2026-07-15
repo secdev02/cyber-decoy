@@ -55,8 +55,17 @@ services:
     restart: unless-stopped
     networks:
       - decoynet
-    # smbd binds 445, a privileged port, and needs to manage its own process
-    # group. Everything here runs as root inside an internal-only container.
+    # Single non-root Python process (Impacket SimpleSMBServer). It only needs
+    # to bind the privileged port 445; everything else is dropped. Read-only
+    # root filesystem since the decoy writes nothing. Note: Impacket's smbserver
+    # carried CVE-2021-31800 (path traversal) which specifically hit honeypots,
+    # so this hardening is deliberate, not boilerplate. requirements.txt pins a
+    # fixed release; keep it current.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     cap_add:
       - NET_BIND_SERVICE
 

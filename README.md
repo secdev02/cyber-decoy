@@ -40,7 +40,7 @@ flowchart TB
             direction LR
             S["ssh-decoy<br/>OpenCanary ssh<br/>port 2222"]
             D["rdp-decoy<br/>OpenCanary rdp<br/>port 3389"]
-            M["smb-decoy<br/>Samba + OpenCanary<br/>port 445"]
+            M["smb-decoy<br/>Impacket SMB server<br/>port 445"]
         end
     end
 
@@ -60,7 +60,7 @@ Four containers in total:
 | `broker`    | Public front door: eBPF observation plus reverse proxy      | edge + decoynet |
 | `ssh-decoy` | OpenCanary `ssh` module (real handshake, captures creds)     | decoynet only  |
 | `rdp-decoy` | OpenCanary `rdp` module (NLA mimic, captures usernames)     | decoynet only  |
-| `smb-decoy` | Samba + OpenCanary `smb` module (audits file access)        | decoynet only  |
+| `smb-decoy` | Impacket SimpleSMBServer (real SMB2/3, captures auth)       | decoynet only  |
 
 The decoys live on an `internal` Docker network (`decoynet`) with no route to
 the host or the outside world. Only the broker can reach them. Nothing an
@@ -120,11 +120,9 @@ cyber-decoy/
     │   ├── Dockerfile
     │   └── opencanary.conf     # rdp module, port 3389
     └── smb/
-        ├── Dockerfile
-        ├── opencanary.conf     # smb module (log watcher)
-        ├── smb.conf            # samba + full_audit VFS
-        ├── rsyslog-samba.conf  # local7 -> samba-audit.log
-        └── supervisord.conf    # rsyslogd + smbd + opencanaryd
+        ├── Dockerfile          # single Python process, non-root
+        ├── smb_decoy.py        # Impacket SimpleSMBServer + JSON logging
+        └── requirements.txt    # impacket (pinned)
 ```
 
 ## Requirements
@@ -244,7 +242,7 @@ without extra plumbing.
 |-------------|-------------------|---------|-----------------------|
 | `ssh-decoy` | `ssh`             | 2222    | Real SSH key exchange via twisted.conch. Captures every username/password pair. |
 | `rdp-decoy` | `rdp`             | 3389    | Mimics an NLA-enabled server, always returns login failure, extracts the `mstshash` username. |
-| `smb-decoy` | `smb`             | 445     | Real Samba with the `full_audit` VFS; OpenCanary tails the audit log and reports file access. |
+| `smb-decoy` | Impacket         | 445     | Pure-Python SMB2/3 server. Presents bait shares and logs connections and NTLM auth attempts as JSON. |
 
 ### Event types
 
@@ -274,8 +272,8 @@ most important thing to understand about reading these logs.
 
 The broker terminates the attacker's TCP connection and opens a **new** one to
 the decoy. So from OpenCanary's point of view, the client is the broker. Every
-`src_host` in a decoy event, and every `%I` in a Samba audit line, will be the
-broker's address on `decoynet`, not the real source.
+`src_host` in a decoy event will be the broker's address on `decoynet`,
+not the real source.
 
 The true source IP is still captured, just in a different place:
 
@@ -295,47 +293,32 @@ docker compose logs ssh-decoy | grep '"logtype": 4002'  # what they tried
 ```
 
 If you need the real IP inside the decoy itself, the options are to send PROXY
-protocol (OpenCanary does not parse it, so this would mean patching it), or to
+protocol (the decoys do not parse it, so this would mean patching them), or to
 replace the userspace proxy with a transparent redirect (TPROXY or eBPF
 `bpf_sk_assign`) that preserves the original source address. Both are listed
 under Roadmap. Until then, treat the broker as the source of truth for "who" and
 the decoy as the source of truth for "what".
 
-### Why the SMB decoy is different
+### The SMB decoy (Impacket, not Samba)
 
-This is the one real wrinkle. **OpenCanary's `smb` module does not implement
-SMB.** Reading `opencanary/modules/samba.py` shows it is a `FileSystemWatcher`:
-it tails an audit file and parses lines containing `smbd_audit`, which are
-produced by a real Samba server running the `full_audit` VFS module.
+Unlike SSH and RDP, this decoy does not use OpenCanary. OpenCanary's smb module
+is only a log watcher: it tails a file and parses `smbd_audit` lines emitted by
+a real Samba server, which meant running Samba plus rsyslog plus opencanaryd
+under supervisord, a five-link chain where any link could fail silently.
 
-So `smb-decoy` runs three processes under supervisord:
+`smb-decoy` replaces all of that with a single Python process built on
+[Impacket](https://github.com/fortra/impacket)'s `SimpleSMBServer`, a pure-Python
+implementation of SMB1/2/3. It binds 445, presents read-only bait shares, answers
+SMB2/3 negotiation (so `nmap -sV` sees a real service), and logs connections and
+NTLM authentication attempts as one JSON object per line on stdout. The captured
+username, domain, and workstation from an attacker's authenticate message are the
+credential-capture payoff.
 
-```
-rsyslogd     receives smbd_audit lines on syslog facility local7
-smbd         the actual SMB protocol implementation
-opencanaryd  tails /var/log/samba-audit.log, emits JSON events
-```
-
-The `full_audit:prefix` in `decoys/smb/smb.conf` is load-bearing, not cosmetic.
-`samba.py` splits each line on `|` and reads fixed positions, so the prefix must
-be exactly:
-
-```
-full_audit:prefix = %U|%I|%i|%m|%S|%L|%R|%a|%T|%D
-```
-
-This is the exact prefix published in Thinkst's
-[OpenCanary and Samba](https://github.com/thinkst/opencanary/wiki/Opencanary-and-Samba)
-wiki page. full_audit appends `action|status|path` after it, giving 13 fields.
-Reordering the prefix will silently produce garbled events rather than an error.
-
-`full_audit:success` is set to `connect disconnect flistxattr`. Thinkst use
-`flistxattr` as the file-open trigger. Valid VFS operation names change between
-Samba releases (for example `open` became `openat`), so if events stop after a
-Samba upgrade, this list is the first thing to check. Confirm the module is
-compiled in with `smbd -b | grep full_audit`.
-
-The SSH and RDP decoys have no such dependency and are single-process.
+Security note: Impacket's smbserver carried a critical path traversal,
+[CVE-2021-31800](https://checkmarx.com/blog/cve-2021-31800-how-we-used-impacket-to-hack-itself/),
+that specifically affected honeypots. It was fixed in 0.9.23. `requirements.txt`
+pins a current release and must not be downgraded below that. The container also
+runs non-root, read-only, with all capabilities dropped except NET_BIND_SERVICE.
 
 ### Configuring the decoys
 
@@ -345,9 +328,9 @@ knobs:
 - **SSH banner**: `ssh.version` in `decoys/ssh/opencanary.conf`. It currently
   claims `SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1`. Make it match the OS you are
   pretending to be; a Ubuntu banner on a box claiming to be Windows is a tell.
-- **SMB share names**: the `[HR-Payroll]` and `[Backups]` sections in
-  `decoys/smb/smb.conf`, plus the bait files created in `decoys/smb/Dockerfile`.
-  The filenames are the lure.
+- **SMB share names**: the `addShare(...)` calls in `decoys/smb/smb_decoy.py`,
+  plus the bait files created in `decoys/smb/Dockerfile`. The share names and
+  filenames are the lure.
 - **Ports**: keep these aligned with `backend` in `broker/config.yaml`.
 
 To enable another OpenCanary module (ftp, telnet, mysql, vnc, redis, and others
@@ -359,6 +342,35 @@ and add a matching service to `broker/config.yaml`.
 `ssh-decoy` mounts a named volume at `/var/lib/opencanary` (`ssh.key_path`), so
 the generated host key survives restarts. Without it OpenCanary generates a fresh
 key on every start and the changing fingerprint is an obvious tell.
+
+## Troubleshooting the SMB decoy
+
+The SMB decoy is now a single process, so troubleshooting is straightforward.
+
+```bash
+docker compose logs -f smb-decoy
+```
+
+Every line is JSON. You should see one `smb_decoy_start` at boot, then
+`smb_connect`, `smb_auth_attempt`, and `smb_tree_connect` events as clients
+interact. Test it from the host with any SMB client:
+
+```bash
+# macOS Finder: Go > Connect to Server
+open 'smb://guest@localhost/HR-Payroll'
+# or from Linux
+smbclient -L //localhost -p 445 -N
+```
+
+Common issues:
+
+- No `smb_decoy_start` line and the container exits: check `requirements.txt`
+  installed cleanly. Impacket needs Python 3.8+; the image uses 3.12.
+- Connects but no `smb_auth_attempt`: some clients enumerate shares anonymously
+  without ever authenticating. That still produces `smb_connect` and
+  `smb_tree_connect`. Force auth by mapping a share with a username.
+- As with the other decoys, `src_host` is the broker's address, not the real
+  attacker. Correlate with broker logs on timestamp.
 
 ## Security notes
 

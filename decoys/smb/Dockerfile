@@ -1,59 +1,27 @@
 # syntax=docker/dockerfile:1
 #
-# SMB decoy: real Samba + OpenCanary's smb module.
-#
-# IMPORTANT: OpenCanary's smb module is a log watcher, not an SMB
-# implementation. See opencanary/modules/samba.py: it tails an audit file and
-# parses "smbd_audit" lines produced by Samba's full_audit VFS module. So this
-# image runs three processes under supervisord (rsyslogd, smbd, opencanaryd).
-# This is the only one of the three decoys that cannot be a single process.
-
-FROM python:3.12-slim AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libffi-dev \
-        libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir --upgrade pip wheel \
-    && pip install --no-cache-dir opencanary
-
+# SMB decoy: a single Python process running Impacket's SimpleSMBServer.
+# This replaces the previous Samba + rsyslog + supervisord + OpenCanary stack.
 FROM python:3.12-slim
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        samba \
-        samba-common-bin \
-        samba-vfs-modules \
-        rsyslog \
-        supervisor \
-    && rm -rf /var/lib/apt/lists/*
+# Impacket has no compiled extensions of its own, but a couple of its
+# dependencies (pycryptodomex) ship wheels, so no build toolchain is needed.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY smb.conf /etc/samba/smb.conf
-COPY rsyslog-samba.conf /etc/rsyslog.conf
-COPY opencanary.conf /etc/opencanaryd/opencanary.conf
-# Replace the main config rather than dropping into conf.d: the [supervisord]
-# section (nodaemon=true) is only honoured in the primary config file.
-COPY supervisord.conf /etc/supervisor/supervisord.conf
+# Non-root user. The decoy binds 445, a privileged port, so the container is
+# granted NET_BIND_SERVICE in docker-compose.yml rather than running as root.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin decoy
 
-# Pre-create the audit file so OpenCanary's FileSystemWatcher has something to
-# attach to at startup, before smbd has emitted anything.
-RUN mkdir -p /var/log/samba /var/run/samba /var/spool/rsyslog \
-        /srv/share/hr /srv/share/backups \
-    && touch /var/log/samba-audit.log
+# Decoy share tree. Read-only bait content. Keep it small and boring.
+RUN mkdir -p /srv/share/hr /srv/share/backups /srv/share/it \
+    && printf 'employee,salary,ssn\n' > /srv/share/hr/payroll_2026_Q1.csv \
+    && printf 'see IT before restoring\n' > /srv/share/backups/README.txt \
+    && printf 'domain admin creds rotation schedule\n' > /srv/share/it/notes.txt \
+    && chown -R decoy:decoy /srv/share
 
-# Bait content. Filenames are the lure; opening any of these is audited and
-# surfaces as an OpenCanary event with USER, SHARENAME, and FILENAME.
-RUN printf 'employee,salary,ssn\n' > /srv/share/hr/payroll_2026_Q1.csv \
-    && printf 'placeholder\n' > /srv/share/hr/salary_review_confidential.xlsx \
-    && printf 'placeholder\n' > /srv/share/backups/domain_controller_backup.bak \
-    && chmod -R a+r /srv/share
+COPY smb_decoy.py /app/smb_decoy.py
 
-# Fail the build rather than ship a broken smb.conf.
-RUN testparm -s /etc/samba/smb.conf > /dev/null
-
+USER decoy
 EXPOSE 445
-
-ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+ENTRYPOINT ["python3", "/app/smb_decoy.py"]
